@@ -19,12 +19,8 @@ logger = logging.getLogger(__name__)
 NEAR_RPC = "https://rpc.mainnet.near.org"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 
-# ---------------------------------------------------------------------------
-# In-memory alert storage  {user_id: [{"direction": "above"/"below",
-#                                       "target": float,
-#                                       "id": int}, ...]}
-# ---------------------------------------------------------------------------
-alerts: dict[int, list[dict]] = {}
+# In-memory alert store: { user_id: [ {id, direction, target, triggered}, ... ] }
+_alerts: dict[int, list[dict]] = {}
 _alert_counter: dict[int, int] = {}
 
 # ---------------------------------------------------------------------------
@@ -34,16 +30,12 @@ async def _rpc(method: str, params: dict | list) -> dict:
     """Send a JSON-RPC request to the NEAR mainnet RPC endpoint."""
     payload = {
         "jsonrpc": "2.0",
-        "id": "near_price_bot",
+        "id": "near-price-bot",
         "method": method,
         "params": params,
     }
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            NEAR_RPC,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
+        async with session.post(NEAR_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
             return await resp.json()
 
@@ -51,227 +43,304 @@ async def _rpc(method: str, params: dict | list) -> dict:
 # 2. NEAR helper functions
 # ---------------------------------------------------------------------------
 async def get_near_price_usd() -> float:
-    """Fetch the current NEAR/USD price from CoinGecko."""
+    """Fetch current NEAR price in USD from CoinGecko."""
     params = {"ids": "near", "vs_currencies": "usd"}
     async with aiohttp.ClientSession() as session:
-        async with session.get(
-            COINGECKO_URL,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
+        async with session.get(COINGECKO_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             resp.raise_for_status()
             data = await resp.json()
             return float(data["near"]["usd"])
 
 
 async def get_near_block_info() -> dict:
-    """Return the latest finalized block info via NEAR RPC."""
+    """Fetch the latest NEAR block information via RPC."""
     result = await _rpc("block", {"finality": "final"})
-    header = result.get("result", {}).get("header", {})
+    block = result.get("result", {})
+    header = block.get("header", {})
     return {
-        "height": header.get("height"),
-        "timestamp_ns": header.get("timestamp"),
-        "hash": header.get("hash"),
+        "height": header.get("height", "N/A"),
+        "timestamp_ns": header.get("timestamp", 0),
+        "hash": header.get("hash", "N/A"),
     }
 
 
 def add_alert(user_id: int, direction: str, target: float) -> int:
-    """
-    Register a new price alert for *user_id*.
-
-    direction : "above" | "below"
-    target    : USD price threshold
-    Returns the new alert id.
-    """
-    _alert_counter[user_id] = _alert_counter.get(user_id, 0) + 1
+    """Add a price alert for a user. direction: 'above' or 'below'."""
+    _alerts.setdefault(user_id, [])
+    _alert_counter.setdefault(user_id, 0)
+    _alert_counter[user_id] += 1
     alert_id = _alert_counter[user_id]
-    alerts.setdefault(user_id, []).append(
-        {"id": alert_id, "direction": direction, "target": target}
-    )
+    _alerts[user_id].append({
+        "id": alert_id,
+        "direction": direction,
+        "target": target,
+        "triggered": False,
+    })
     return alert_id
 
 
+def get_alerts(user_id: int) -> list[dict]:
+    """Return all active (non-triggered) alerts for a user."""
+    return [a for a in _alerts.get(user_id, []) if not a["triggered"]]
+
+
 def remove_alert(user_id: int, alert_id: int) -> bool:
-    """Delete alert *alert_id* for *user_id*. Returns True if found."""
-    user_alerts = alerts.get(user_id, [])
-    new_list = [a for a in user_alerts if a["id"] != alert_id]
-    if len(new_list) == len(user_alerts):
-        return False
-    alerts[user_id] = new_list
-    return True
+    """Remove an alert by ID. Returns True if found and removed."""
+    alerts = _alerts.get(user_id, [])
+    for i, alert in enumerate(alerts):
+        if alert["id"] == alert_id:
+            alerts.pop(i)
+            return True
+    return False
 
 
-async def check_and_fire_alerts(current_price: float, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Compare *current_price* against every registered alert.
-    Fire (and remove) any alert whose condition is satisfied.
-    """
-    fired: list[tuple[int, dict]] = []
-
-    for user_id, user_alerts in list(alerts.items()):
-        for alert in list(user_alerts):
-            triggered = (
-                alert["direction"] == "above" and current_price >= alert["target"]
-            ) or (
-                alert["direction"] == "below" and current_price <= alert["target"]
-            )
-            if triggered:
-                fired.append((user_id, alert))
-
-    for user_id, alert in fired:
-        direction_word = "risen above" if alert["direction"] == "above" else "fallen below"
-        msg = (
-            f"🚨 *NEAR Price Alert Triggered!*\n\n"
-            f"NEAR has {direction_word} your target of *${alert['target']:.4f}*.\n"
-            f"Current price: *${current_price:.4f}*\n\n"
-            f"Alert #{alert['id']} has been removed."
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=msg,
-                parse_mode="Markdown",
-            )
-        except Exception as exc:
-            logger.warning("Failed to notify user %s: %s", user_id, exc)
-        remove_alert(user_id, alert["id"])
-
+async def check_alerts_for_user(user_id: int, current_price: float) -> list[dict]:
+    """Check which alerts have been triggered for a user at the given price."""
+    triggered = []
+    for alert in _alerts.get(user_id, []):
+        if alert["triggered"]:
+            continue
+        if alert["direction"] == "above" and current_price >= alert["target"]:
+            alert["triggered"] = True
+            triggered.append(alert)
+        elif alert["direction"] == "below" and current_price <= alert["target"]:
+            alert["triggered"] = True
+            triggered.append(alert)
+    return triggered
 
 # ---------------------------------------------------------------------------
-# 3. /start and /help
+# 3. /start and /help handlers
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message."""
+    """Send a welcome message explaining the bot."""
+    user = update.effective_user
     text = (
-        "👋 *Welcome to the NEAR Price Alert Bot!*\n\n"
-        "I watch the NEAR/USD price and notify you the moment it crosses "
-        "your chosen threshold.\n\n"
-        "Use /help to see all available commands."
+        f"👋 Hello, {user.first_name}! Welcome to the *NEAR Price Alert Bot*.\n\n"
+        "I watch the NEAR token price and notify you when your target is hit.\n\n"
+        "📌 *Quick Commands:*\n"
+        "• /price — current NEAR price\n"
+        "• /setalert above 6.50 — alert when price goes above $6.50\n"
+        "• /setalert below 4.00 — alert when price drops below $4.00\n"
+        "• /alerts — list your active alerts\n"
+        "• /removealert <id> — delete an alert\n"
+        "• /checkalerts — manually check your alerts now\n"
+        "• /blockinfo — latest NEAR block info\n"
+        "• /help — show this message\n\n"
+        "Set your first alert and I'll ping you the moment it triggers! 🚀"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all commands."""
+    """Display detailed help."""
     text = (
-        "📖 *Available Commands*\n\n"
-        "/price — Show the current NEAR/USD price\n"
-        "/setalert `<above|below>` `<price>` — Set a price alert\n"
-        "  _Example:_ `/setalert above 8.50`\n"
-        "/listalerts — Show your active alerts\n"
-        "/removealert `<id>` — Remove an alert by its ID\n"
-        "/checkblock — Show the latest NEAR block info\n"
-        "/help — Show this message"
+        "🤖 *NEAR Price Alert Bot — Help*\n\n"
+        "*Commands:*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📈 `/price`\n"
+        "  → Fetch the current NEAR/USD price.\n\n"
+        "🔔 `/setalert <above|below> <price>`\n"
+        "  → Set a price alert.\n"
+        "  Example: `/setalert above 6.50`\n\n"
+        "📋 `/alerts`\n"
+        "  → List all your active alerts.\n\n"
+        "🗑 `/removealert <id>`\n"
+        "  → Cancel an alert by its ID.\n"
+        "  Example: `/removealert 3`\n\n"
+        "🔍 `/checkalerts`\n"
+        "  → Manually check if any of your alerts have triggered.\n\n"
+        "⛓ `/blockinfo`\n"
+        "  → Show the latest NEAR blockchain block information.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Alerts are checked every time you use `/checkalerts`. "
+        "For automatic checking, the bot polls every 60 seconds if you have active alerts."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
-
 
 # ---------------------------------------------------------------------------
 # 4. Command handlers
 # ---------------------------------------------------------------------------
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/price — Fetch and display the current NEAR price."""
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch and display the current NEAR price."""
     try:
-        usd = await get_near_price_usd()
-        await update.message.reply_text(
-            f"💰 *NEAR / USD*\n\nCurrent price: *${usd:.4f}*",
-            parse_mode="Markdown",
+        price = await get_near_price_usd()
+        text = (
+            f"💰 *NEAR Price*\n\n"
+            f"Current Price: `${price:,.4f} USD`\n\n"
+            f"_Source: CoinGecko_"
         )
+        await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as exc:
-        logger.error("price fetch error: %s", exc)
-        await update.message.reply_text("⚠️ Could not fetch the price. Please try again later.")
+        logger.error("price_command error: %s", exc)
+        await update.message.reply_text("❌ Failed to fetch NEAR price. Please try again shortly.")
 
 
-async def setalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/setalert <above|below> <price> — Register a new price alert."""
+async def setalert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Set a price alert.
+    Usage: /setalert <above|below> <price>
+    Example: /setalert above 6.50
+    """
     args = context.args
-    if len(args) != 2 or args[0].lower() not in ("above", "below"):
+    if len(args) != 2:
         await update.message.reply_text(
-            "Usage: `/setalert <above|below> <price>`\nExample: `/setalert above 8.50`",
+            "⚠️ Usage: `/setalert <above|below> <price>`\n"
+            "Example: `/setalert above 6.50`",
             parse_mode="Markdown",
         )
         return
 
     direction = args[0].lower()
+    if direction not in ("above", "below"):
+        await update.message.reply_text(
+            "⚠️ Direction must be `above` or `below`.\n"
+            "Example: `/setalert below 4.00`",
+            parse_mode="Markdown",
+        )
+        return
+
     try:
         target = float(args[1])
+        if target <= 0:
+            raise ValueError("Price must be positive.")
     except ValueError:
-        await update.message.reply_text("⚠️ Price must be a number, e.g. `8.50`.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Please provide a valid positive number for the price.")
         return
 
     user_id = update.effective_user.id
     alert_id = add_alert(user_id, direction, target)
 
-    # Immediately check whether the alert is already satisfied
-    try:
-        current = await get_near_price_usd()
-        await check_and_fire_alerts(current, context)
-    except Exception:
-        pass  # Non-fatal; alert is stored regardless
-
+    emoji = "📈" if direction == "above" else "📉"
     await update.message.reply_text(
-        f"✅ Alert #{alert_id} set!\n\n"
-        f"I'll notify you when NEAR goes *{direction}* *${target:.4f}*.",
+        f"{emoji} *Alert Set!*\n\n"
+        f"Alert ID: `{alert_id}`\n"
+        f"Trigger: NEAR goes *{direction}* `${target:,.4f}`\n\n"
+        f"Use /checkalerts to check manually, or I'll notify you automatically.",
         parse_mode="Markdown",
     )
 
 
-async def listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/listalerts — Show the caller's active alerts."""
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all active alerts for the user."""
     user_id = update.effective_user.id
-    user_alerts = alerts.get(user_id, [])
+    active = get_alerts(user_id)
 
-    if not user_alerts:
-        await update.message.reply_text("ℹ️ You have no active alerts. Use /setalert to create one.")
-        return
-
-    lines = ["📋 *Your Active Alerts*\n"]
-    for alert in user_alerts:
-        arrow = "⬆️" if alert["direction"] == "above" else "⬇️"
-        lines.append(f"{arrow} Alert #{alert['id']} — NEAR {alert['direction']} *${alert['target']:.4f}*")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def removealert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/removealert <id> — Delete an alert by ID."""
-    if not context.args or not context.args[0].isdigit():
+    if not active:
         await update.message.reply_text(
-            "Usage: `/removealert <id>`\nFind IDs with /listalerts.",
+            "📋 You have no active alerts.\n\nUse `/setalert above 6.50` to create one.",
             parse_mode="Markdown",
         )
         return
 
-    user_id = update.effective_user.id
-    alert_id = int(context.args[0])
+    lines = ["📋 *Your Active Alerts:*\n"]
+    for alert in active:
+        emoji = "📈" if alert["direction"] == "above" else "📉"
+        lines.append(
+            f"{emoji} ID `{alert['id']}` — NEAR *{alert['direction']}* `${alert['target']:,.4f}`"
+        )
+    lines.append("\nUse `/removealert <id>` to cancel an alert.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    if remove_alert(user_id, alert_id):
-        await update.message.reply_text(f"🗑️ Alert #{alert_id} has been removed.")
+
+async def removealert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Remove an alert by ID.
+    Usage: /removealert <id>
+    """
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text(
+            "⚠️ Usage: `/removealert <id>`\nExample: `/removealert 2`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        alert_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Alert ID must be an integer.")
+        return
+
+    user_id = update.effective_user.id
+    removed = remove_alert(user_id, alert_id)
+
+    if removed:
+        await update.message.reply_text(
+            f"🗑 Alert `{alert_id}` has been removed.",
+            parse_mode="Markdown",
+        )
     else:
         await update.message.reply_text(
-            f"⚠️ No alert with ID #{alert_id} found. Use /listalerts to see your alerts."
+            f"❌ No active alert with ID `{alert_id}` found.",
+            parse_mode="Markdown",
         )
 
 
-async def checkblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/checkblock — Display the latest NEAR block information."""
+async def checkalerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually check all active alerts against the current NEAR price."""
+    user_id = update.effective_user.id
+    active = get_alerts(user_id)
+
+    if not active:
+        await update.message.reply_text(
+            "📋 You have no active alerts to check.\n\nCreate one with `/setalert above 6.50`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        price = await get_near_price_usd()
+    except Exception as exc:
+        logger.error("checkalerts price fetch error: %s", exc)
+        await update.message.reply_text("❌ Could not fetch NEAR price right now. Try again later.")
+        return
+
+    triggered = await check_alerts_for_user(user_id, price)
+
+    if triggered:
+        lines = [f"🚨 *Alert(s) Triggered!* — NEAR is `${price:,.4f}`\n"]
+        for alert in triggered:
+            emoji = "📈" if alert["direction"] == "above" else "📉"
+            lines.append(
+                f"{emoji} Alert `{alert['id']}`: NEAR went *{alert['direction']}* `${alert['target']:,.4f}` ✅"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    else:
+        remaining = get_alerts(user_id)
+        lines = [
+            f"✅ *No alerts triggered yet.*\n",
+            f"Current NEAR price: `${price:,.4f}`\n",
+            f"Active alerts: {len(remaining)}\n",
+        ]
+        for alert in remaining:
+            emoji = "📈" if alert["direction"] == "above" else "📉"
+            lines.append(
+                f"{emoji} ID `{alert['id']}` — {alert['direction']} `${alert['target']:,.4f}`"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def blockinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch and display the latest NEAR block information."""
     try:
         info = await get_near_block_info()
-        # Convert nanosecond timestamp to seconds
-        ts_sec = (info.get("timestamp_ns") or 0) // 1_000_000_000
+        # Convert nanoseconds timestamp to seconds
+        ts_ns = info["timestamp_ns"]
+        ts_s = ts_ns // 1_000_000_000 if ts_ns else 0
+
         from datetime import datetime, timezone
-        dt_str = datetime.fromtimestamp(ts_sec, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        dt = datetime.fromtimestamp(ts_s, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if ts_s else "N/A"
 
         text = (
-            "🔗 *Latest NEAR Block*\n\n"
-            f"• Height : `{info.get('height')}`\n"
-            f"• Time   : `{dt_str}`\n"
-            f"• Hash   : `{info.get('hash')}`"
+            "⛓ *Latest NEAR Block*\n\n"
+            f"Height:    `{info['height']:,}`\n"
+            f"Hash:      `{info['hash'][:20]}…`\n"
+            f"Timestamp: `{dt}`"
         )
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as exc:
-        logger.error("checkblock error: %s", exc)
-        await update.message.reply_text("⚠️ Could not fetch block info. Please try again later.")
+        logger.error("blockinfo_command error: %s", exc)
+        await update.message.reply_text("❌ Failed to fetch block info from NEAR RPC.")
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
@@ -279,11 +348,11 @@ def main() -> None:
     application = ApplicationBuilder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("price", price))
-    application.add_handler(CommandHandler("setalert", setalert))
-    application.add_handler(CommandHandler("listalerts", listalerts))
-    application.add_handler(CommandHandler("removealert", removealert))
-    application.add_handler(CommandHandler("checkblock", checkblock))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("setalert", setalert_command))
+    application.add_handler(CommandHandler("alerts", alerts_command))
+    application.add_handler(CommandHandler("removealert", removealert_command))
+    application.add_handler(CommandHandler("checkalerts", checkalerts_command))
     application.run_polling()
 
 if __name__ == "__main__":
